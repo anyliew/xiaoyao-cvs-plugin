@@ -156,3 +156,8 @@ git clone https://github.com/cchanlan/xiaoyao-cvs-plugin.git ./plugins/xiaoyao-c
 - [爱发电](https://afdian.net/a/Ctrlcvs)
 - 图片素材来源于网络，仅供交流学习使用
 - 严禁用于任何商业用途和非法行为
+
+
+### UID 删除与记录查询
+
+自动更新抽卡记录跟随 genshin 当前原神 UID。删除全部绑定后需重新绑定；当前号缺少凭据时需为该号扫码登录，不再自动改用其他有凭据的账号。

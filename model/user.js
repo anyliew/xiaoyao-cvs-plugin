@@ -20,7 +20,7 @@ const yamlDataUrl = `${_path}/plugins/xiaoyao-cvs-plugin/data/yaml`;
  * 米游社账号数据
  *
  * ⚠️ 与 genshin 插件的联动是这套功能的地基，别拆：
- * `getCookie()` 会从 genshin 的绑定库（`data/MysCookie/<QQ>.yaml`）取 ck 并**顺手把 uid 写进 e.uid**，
+ * `getCookie()` 会从 genshin 当前绑定库取对应 UID 的 ck，并把 uid 写进 e.uid，
  * 抽卡记录的 authkey（`getAuthKey`）就靠这个 uid；扫码登录的最后一步也是调 genshin 的
  * `user.bing()` 把 ck 绑过去。去掉这一步会表现为「authkey 获取失败：登录状态失效」
  * （日志里 uid 是 undefined），而不是报缺函数。
@@ -40,110 +40,51 @@ export default class user {
     async getData(type, data = {}, isck = true) {
         if (isck) {
             await this.cookie(this.e)
+            if (type === "authKey" && !this.e.uid) return { message: "尚未绑定原神UID，请先绑定后再查询" }
         }
         this.miHoYoApi = new miHoYoApi(this.e);
         let res = await this.miHoYoApi.getData(type, data)
         return res
     }
 
-    /**
-     * 取该用户在 genshin 侧绑定的 ck，并把 uid 写进 e.uid
-     * （扫码登录 / 抽卡记录都依赖它，见类头注释）
-     *
-     * ⚠️ 不能直接用 genshin 返回的 `skuid.item`：那是绑定库里 **isMain** 那条的 uid，
-     * 而一个通行证下常挂多个角色（原神 / 星铁 / 绝区零），isMain 未必是用户在
-     * 本插件里扫码绑过的那个。用错 uid 时 miHoYoApi 取不到 stoken（cookies 为空），
-     * 表现就是「authkey 获取失败：登录状态失效」—— 但 ck 其实是好的。
-     * 所以这里换成「同一通行证下、本插件 yaml 里确实有 stoken」的那个 uid。
-     */
+    /** 默认请求只使用当前绑定 UID，缺凭据时不能切换到其他账号。 */
     async getCookie(e) {
-        let skuid, cookie, uid
+        let skuid, cookie, uid = ''
+        // 先清掉上一次请求写入的上下文，读库失败也不能沿用旧号。
+        e.uid = this.e.uid = ''
+        e.cookie = this.e.cookie = ''
+        this.currentSkuid = null
         if (isV3) {
-            skuid = await gsCfg.getBingCookie(e.user_id);
-            cookie = skuid?.ck;
-            // #uid 切换只写 genshin 的 SQLite，data/MysCookie/<QQ>.yaml 是启动时回灌的旧快照，
-            // 只读它会把 uid 钉死在最早的 isMain 上 —— 用户切了号，更新的还是老号
-            let liveUid = await this.getLiveUid(e)
-            uid = liveUid || skuid?.item;
-            uid = this.pickUidWithStoken(e.user_id, gsCfg.getBingLtuid(e.user_id, uid), uid)
-            if (!uid && e?.user?.getUid) {
-                uid = e?.user?.getUid('gs')
-                cookie = e?.user?.mysUser?.ck
-            }
-        }
-        if (!uid) {
-            uid = e.runtime?.user?._regUid
-        }
-        this.e.uid = uid;
-        this.e.cookie = cookie;
-        return {
-            cookie,
-            uid,
-            skuid
-        }
-    }
-
-    /**
-     * 取 genshin 当前生效的原神 uid（读它的 SQLite，实时值）
-     *
-     * `#uid` 切换只写数据库，不碰本插件读的 `data/MysCookie/<QQ>.yaml`（启动时才回灌一次），
-     * 所以那个文件里的 isMain 会一直是老号。取不到时返回空串，由调用方回落到旧逻辑。
-     */
-    async getLiveUid(e) {
-        try {
-            let { default: NoteUser } = await import(pathToFileURL(`${_path}/plugins/genshin/model/mys/NoteUser.js`).href)
-            let noteUser = await NoteUser.create(e)
-            return String(noteUser?.getUid?.('gs') || '')
-        } catch (err) {
-            return ''
-        }
-    }
-
-    /**
-     * 在「本插件已绑定的账号」里，挑一个可用于查抽卡记录的 uid
-     *
-     * 优先级（前一步失败才走下一步）：
-     *  1. genshin 给的 uid 本身就有 stoken —— 最常见，直接返回
-     *  2. 同一个通行证（ltuid）下、本插件 yaml 里存了 stoken 的角色
-     *  3. yaml 里任意一个存了 stoken 的账号 —— 兜底
-     *
-     * 第 3 条是必须的：用户在 genshin 侧的主号可能根本没在本插件扫过码
-     * （比如 #删除ck 之后又重新绑了别的号），只按通行证找会全部落空，
-     * 又退回报「登录状态失效」—— 但手上明明有可用的凭证。
-     *
-     * @param {string} userId QQ
-     * @param {string} ltuid 通行证 id（来自 genshin 绑定库）
-     * @param {string} fallbackUid genshin 给的 isMain uid，都没得挑时原样返回
-     * @returns {string} 可用的 uid，或 fallbackUid
-     */
-    pickUidWithStoken(userId, ltuid, fallbackUid = '') {
-        let mine = {}
-        try {
-            mine = YAML.parse(fs.readFileSync(`${yamlDataUrl}/${userId}.yaml`, 'utf-8')) || {}
-        } catch (err) {
-            // 没绑过 / 文件损坏：保持原样，由调用方走后续降级
-            return fallbackUid
-        }
-        const hasSk = (uid) => !!mine[String(uid)]?.stoken
-        // ① genshin 给的 uid 就有 stoken
-        if (fallbackUid && hasSk(fallbackUid)) return fallbackUid
-        // ② 同一通行证下的其它角色
-        if (ltuid) {
-            for (let uid of Object.keys(mine)) {
-                if (String(mine[uid]?.stuid || '') === String(ltuid) && hasSk(uid)) {
-                    logger.debug(`[米游社] 通行证 ${ltuid} 改用本插件已绑定的 uid ${uid}（genshin isMain 是 ${fallbackUid}）`)
-                    return uid
+            const liveUser = await this.getLiveUser(e)
+            if (liveUser) {
+                uid = String(liveUser.getUid('gs') || '')
+                const ltuid = uid && liveUser.getUidData(uid, 'gs')?.ltuid
+                cookie = ltuid ? liveUser.mysUsers?.[ltuid]?.ck : ''
+                if (uid) {
+                    const snapshot = await gsCfg.getBingCookie(e.user_id)
+                    if (String(snapshot?.item || '') === uid) skuid = snapshot
                 }
+            } else {
+                // 无 genshin 的旧宿主才允许使用自身绑定源。
+                skuid = await gsCfg.getBingCookie(e.user_id)
+                uid = String(skuid?.item || '')
+                cookie = skuid?.ck
             }
+        } else {
+            uid = e.runtime?.user?._regUid || ''
         }
-        // ③ 任意一个有凭证的账号兜底
-        for (let uid of Object.keys(mine)) {
-            if (hasSk(uid)) {
-                logger.debug(`[米游社] genshin 的 uid ${fallbackUid} 在本插件无凭证，改用已绑定的 ${uid}`)
-                return uid
-            }
-        }
-        return fallbackUid
+        e.uid = this.e.uid = uid
+        e.cookie = this.e.cookie = cookie || ''
+        this.currentSkuid = skuid
+        return { cookie, uid, skuid }
+    }
+
+    /** 空绑定和读取失败都不能回退到旧快照；只有宿主无此模块才走旧接口。 */
+    async getLiveUser(e) {
+        const file = `${_path}/plugins/genshin/model/mys/NoteUser.js`
+        if (!fs.existsSync(file)) return null
+        const { default: NoteUser } = await import(pathToFileURL(file).href)
+        return NoteUser.create(e)
     }
 
     /**
@@ -185,7 +126,7 @@ export default class user {
         let loginTicket = map?.get("login_ticket");
         const loginUid = map?.get("login_uid") ? map?.get("login_uid") : map?.get("ltuid");
         if (isV3) {
-            loginTicket = gsCfg.getBingCookie(e.user_id).login_ticket
+            loginTicket = this.currentSkuid?.login_ticket || loginTicket
         }
         let mhyapi = new miHoYoApi(this.e);
         let res = await mhyapi.getData("bbsStoken", {

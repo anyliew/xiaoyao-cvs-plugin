@@ -379,7 +379,7 @@ async function purgeDeadCk(e) {
 async function getAuthKey(e, user, data = {
 	auth_appid: 'webview_gacha'
 }) {
-	if (!e.uid) {
+	if (!e.uid && !isV3) {
 		e.uid = e?.runtime?.user?._regUid
 	}
 	if (!e.uid) {
