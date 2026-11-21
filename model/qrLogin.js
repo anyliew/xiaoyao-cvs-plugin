@@ -41,17 +41,17 @@ export default class mysQrLogin {
 				device: this.device, ticket
 			}, false)
 			if (res?.data?.status == "Scanned" && RedisData.GetQrCode == 1) {
-				logger.mark(JSON.stringify(res))
+				logger.mark('[扫码登录] 二维码已扫描')
 				await this.e.reply("二维码已扫描，请确认登录", true)
 				RedisData.GetQrCode++;
 			}
 			if (res?.data?.status == "Confirmed") {
-				logger.mark(JSON.stringify(res))
+				logger.mark('[扫码登录] 用户已确认登录')
 				break
 			}
 		}
 		await utils.redisDel(this.e.user_id, 'GetQrCode')
-		if (!res?.data?.tokens && !res?.data?.user_info) {
+		if (res?.data?.status !== 'Confirmed' || !Array.isArray(res?.data?.tokens) || !res?.data?.user_info) {
 			await this.e.reply("验证超时", true)
 			return false
 		}
@@ -63,6 +63,10 @@ export default class mysQrLogin {
 			return false
 		}
 		let UserData = await this.user.getData("bbsGetCookie", { cookies: `stoken=${token}&uid=${uid}&mid=${mid}` }, false)
+		if (!UserData?.data?.cookie_token) {
+			await this.e.reply('登录凭证换取失败，请稍后重新扫码~', true)
+			return false
+		}
 		let stoken = `stoken=${token};stuid=${uid};mid=${mid}`
 		return {
 			cookie: `ltoken=${token};ltuid=${uid};cookie_token=${UserData.data?.cookie_token}`,

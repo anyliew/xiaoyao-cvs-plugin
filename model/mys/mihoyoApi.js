@@ -68,6 +68,69 @@ export default class miHoYoApi {
 	}
 
 	async getData(type, data = {}) {
+		if (type === 'bbsGetCookie') return this.getCookieWithFallback(data)
+		return this.requestData(type, data)
+	}
+
+	/** 换票单次请求最多等待10秒，异常不输出含凭据的URL或请求体。 */
+	async requestCookie(type, data) {
+		const controller = new AbortController()
+		const timer = setTimeout(() => controller.abort(), 10000)
+		try {
+			return await this.requestData(type, { ...data, signal: controller.signal })
+		} catch {
+			logger.warn('[换取CK] 接口响应异常')
+			return false
+		} finally {
+			clearTimeout(timer)
+		}
+	}
+
+	/** 所有换CK入口共用：主接口成功即返回，失败才尝试同一账号的备用接口。 */
+	async getCookieWithFallback(data) {
+		const valid = value => typeof value === 'string' && value.trim() !== '' && !['undefined', 'null'].includes(value.trim())
+		const failure = res => ({
+			retcode: res?.retcode && res.retcode !== 0 ? res.retcode : -1,
+			message: res?.message && res.message !== 'OK' ? res.message : '换取登录凭证失败，请稍后重试',
+			data: null,
+			api: 'bbsGetCookie'
+		})
+		const primary = await this.requestCookie('bbsGetCookie', data)
+		if (primary?.retcode === 0 && valid(primary.data?.cookie_token)) return primary
+
+		// exchange是国服通行证接口，海外服保留原请求方式。
+		if (this.isOs) return failure(primary)
+		const credentials = new Map()
+		for (const item of String(data.cookies || '').split(/[;&]/)) {
+			const index = item.indexOf('=')
+			if (index < 0) continue
+			const decode = value => { try { return decodeURIComponent(value.trim()) } catch { return value.trim() } }
+			credentials.set(decode(item.slice(0, index)), decode(item.slice(index + 1)))
+		}
+		const token = credentials.get('stoken')
+		const mid = credentials.get('mid')
+		const uid = credentials.get('uid') || credentials.get('stuid') || credentials.get('ltuid') || credentials.get('account_id')
+		// 不从当前绑定或其他账号补mid，以免混用两套凭据。
+		if (!valid(token) || !valid(mid) || !/^\d+$/.test(uid || '')) return failure(primary)
+		logger.mark('[换取CK] 主接口未取得有效凭证，尝试备用接口')
+		const backup = await this.requestCookie('exchange', {
+			token, mid,
+			headers: { Cookie: `stuid=${uid};stoken=${token};mid=${mid};` }
+		})
+		const info = backup?.data?.user_info
+		const account = info?.aid || info?.uid || info?.account_id
+		const cookie = backup?.data?.token
+		if (backup?.retcode === 0 && cookie?.token_type === 4 && valid(cookie.token) &&
+			String(account || '') === uid && (!info.mid || info.mid === mid)) {
+			logger.mark('[换取CK] 备用接口换取成功')
+			return { retcode: 0, message: 'OK', data: { cookie_token: cookie.token, uid }, api: 'bbsGetCookie' }
+		}
+		logger.warn('[换取CK] 备用接口未取得有效凭证')
+		// 备用接口网络异常时不能沿用主接口的“登录失效”，避免误清理凭据。
+		return failure(backup)
+	}
+
+	async requestData(type, data = {}) {
 		let gameBody = this.getBody(data.name);
 		let {
 			url,
@@ -86,7 +149,8 @@ export default class miHoYoApi {
 		let param = {
 			headers,
 			agent: await this.getAgent(),
-			timeout: 10000
+			timeout: 10000,
+			signal: data.signal
 		}
 
 		if (body) {
@@ -104,7 +168,8 @@ export default class miHoYoApi {
 		try {
 			response = await fetch(url, param)
 		} catch (error) {
-			logger.error(error.toString())
+			if (type === 'bbsGetCookie' || type === 'exchange') logger.warn('[换取CK] 接口请求失败')
+			else logger.error(error.toString())
 			return false
 		}
 		if (!response.ok) {
@@ -123,7 +188,7 @@ export default class miHoYoApi {
 			Bot.logger.mark('mys接口没有返回')
 			return false
 		}
-		if (res.retcode !== 0) {
+		if (res.retcode !== 0 && type !== 'bbsGetCookie' && type !== 'exchange') {
 			Bot.logger.debug(`[米游社接口][请求参数] ${url} ${JSON.stringify(param)}`)
 		}
 		res.api = type
@@ -140,6 +205,11 @@ export default class miHoYoApi {
 				url: `${this.apiMap.apiWeb}/auth/api/getCookieAccountInfoBySToken`,
 				query: `game_biz=hk4e_cn&${data.cookies}`,
 				types: ''
+			},
+			exchange: {
+				url: `${mys.pass_api}/account/ma-cn-session/app/exchange`,
+				body: { src_token: { token: data.token, token_type: 1 }, mid: data.mid, dst_token_type: 4 },
+				types: 'pass'
 			},
 			bbsStoken: {
 				url: `${this.apiMap.apiWeb}/auth/api/getMultiTokenByLoginTicket`,
